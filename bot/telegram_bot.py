@@ -60,6 +60,13 @@ class ChatGPTTelegramBot:
         self.last_message = {}
         self.inline_queries_cache = {}
 
+        self.user_messages_logger = logging.getLogger("user_messages")
+        self.user_messages_logger.setLevel(logging.INFO)
+        fh = logging.FileHandler("user_messages.log", encoding="utf-8")
+        formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        fh.setFormatter(formatter)
+        self.user_messages_logger.addHandler(fh)
+
     async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Shows the help menu.
@@ -647,6 +654,7 @@ class ChatGPTTelegramBot:
 
         logging.info(
             f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        self.user_messages_logger.info(update.message.text)
         chat_id = update.effective_chat.id
         user_id = update.message.from_user.id
         prompt = message_text(update.message)
