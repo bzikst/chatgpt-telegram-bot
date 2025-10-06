@@ -133,11 +133,13 @@ async def edit_message_with_retry(context: ContextTypes.DEFAULT_TYPE, chat_id: i
                 text=text,
             )
         except Exception as e:
-            logging.warning(f'Failed to edit message: {str(e)}')
+            if isinstance(e, telegram.error.BadRequest) and str(e).startswith("Message is not modified"):
+                return
+            logging.debug(f'Failed to edit message (fallback, non-markdown): {str(e)}')
             raise e
 
     except Exception as e:
-        logging.warning(str(e))
+        logging.debug(str(e))
         raise e
 
 

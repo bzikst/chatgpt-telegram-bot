@@ -128,6 +128,22 @@ Check out the [Budget Manual](https://github.com/n3d1117/chatgpt-telegram-bot/di
 
 Check out the [official API reference](https://platform.openai.com/docs/api-reference/chat) for more details.
 
+#### Responses API and Web Search
+
+To use the new OpenAI Responses API and optionally enable built-in web search:
+
+- Set `USE_RESPONSES_API=true` to switch from Chat Completions to Responses API.
+- Set `ENABLE_WEB_SEARCH=true` to allow the model to use the web search tool when using Responses API.
+
+Example `.env` additions:
+
+```
+USE_RESPONSES_API=true
+ENABLE_WEB_SEARCH=true
+```
+
+Reference: Responses API `create` endpoint `https://platform.openai.com/docs/api-reference/responses/create`.
+
 #### Functions
 | Parameter                         | Description                                                                                                                                      | Default value                       |
 |-----------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------|

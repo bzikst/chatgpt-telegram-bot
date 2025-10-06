@@ -114,6 +114,31 @@ class OpenAIHelper:
         self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
         self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
 
+    def __to_responses_message(self, role: str, content) -> dict | None:
+        """
+        Convert an existing chat message (role, content) into Responses API input message.
+        Skips unsupported roles (like function) for now.
+        """
+        if role == 'function':
+            return None
+        blocks = []
+        if isinstance(content, str):
+            block_type = 'input_text' if role in ('user', 'system', 'developer') else 'output_text'
+            blocks.append({'type': block_type, 'text': content})
+        else:
+            for part in content:
+                ptype = part.get('type')
+                if ptype == 'text':
+                    block_type = 'input_text' if role in ('user', 'system', 'developer') else 'output_text'
+                    blocks.append({'type': block_type, 'text': part.get('text', '')})
+                elif ptype == 'image_url':
+                    # convert to input_image; assistant images are rare, treat as input_image for simplicity
+                    blocks.append({'type': 'input_image', 'image_url': part.get('image_url', {})})
+                else:
+                    # passthrough unknown
+                    blocks.append(part)
+        return {'role': role, 'content': blocks}
+
     def get_conversation_stats(self, chat_id: int) -> tuple[int, int]:
         """
         Gets the number of messages and tokens used in the conversation.
@@ -133,39 +158,51 @@ class OpenAIHelper:
         """
         plugins_used = ()
         response = await self.__common_get_chat_response(chat_id, query)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-            response, plugins_used = await self.__handle_function_call(chat_id, response)
-            if is_direct_result(response):
-                return response, '0'
+        if not self.config.get('use_responses_api', False):
+            if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
+                response, plugins_used = await self.__handle_function_call(chat_id, response)
+                if is_direct_result(response):
+                    return response, '0'
 
-        answer = ''
+            answer = ''
 
-        if len(response.choices) > 1 and self.config['n_choices'] > 1:
-            for index, choice in enumerate(response.choices):
-                content = choice.message.content.strip()
-                if index == 0:
-                    self.__add_to_history(chat_id, role="assistant", content=content)
-                answer += f'{index + 1}\u20e3\n'
-                answer += content
-                answer += '\n\n'
+            if len(response.choices) > 1 and self.config['n_choices'] > 1:
+                for index, choice in enumerate(response.choices):
+                    content = choice.message.content.strip()
+                    if index == 0:
+                        self.__add_to_history(chat_id, role="assistant", content=content)
+                    answer += f'{index + 1}\u20e3\n'
+                    answer += content
+                    answer += '\n\n'
+            else:
+                answer = response.choices[0].message.content.strip()
+                self.__add_to_history(chat_id, role="assistant", content=answer)
+
+            bot_language = self.config['bot_language']
+            show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
+            plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
+            if self.config['show_usage']:
+                answer += "\n\n---\n" \
+                          f"💰 {str(response.usage.total_tokens)} {localized_text('stats_tokens', bot_language)}" \
+                          f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
+                          f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+                if show_plugins_used:
+                    answer += f"\n🔌 {', '.join(plugin_names)}"
+            elif show_plugins_used:
+                answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
+
+            return answer, response.usage.total_tokens
         else:
-            answer = response.choices[0].message.content.strip()
-            self.__add_to_history(chat_id, role="assistant", content=answer)
-
-        bot_language = self.config['bot_language']
-        show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
-        plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
-        if self.config['show_usage']:
-            answer += "\n\n---\n" \
-                      f"💰 {str(response.usage.total_tokens)} {localized_text('stats_tokens', bot_language)}" \
-                      f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
-                      f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
-            if show_plugins_used:
-                answer += f"\n🔌 {', '.join(plugin_names)}"
-        elif show_plugins_used:
-            answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
-
-        return answer, response.usage.total_tokens
+            # Responses API path
+            answer = response.output_text.strip() if hasattr(response, 'output_text') and response.output_text else ''
+            if answer:
+                self.__add_to_history(chat_id, role="assistant", content=answer)
+            usage_total = getattr(response, 'usage', None).total_tokens if getattr(response, 'usage', None) else self.__count_tokens(self.conversations[chat_id])
+            if self.config['show_usage']:
+                bot_language = self.config['bot_language']
+                answer += "\n\n---\n" \
+                          f"💰 {str(usage_total)} {localized_text('stats_tokens', bot_language)}"
+            return answer, str(usage_total)
 
     async def get_chat_response_stream(self, chat_id: int, query: str):
         """
@@ -175,35 +212,115 @@ class OpenAIHelper:
         :return: The answer from the model and the number of tokens used, or 'not_finished'
         """
         plugins_used = ()
-        response = await self.__common_get_chat_response(chat_id, query, stream=True)
-        if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-            response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
-            if is_direct_result(response):
-                yield response, '0'
-                return
+        if not self.config.get('use_responses_api', False):
+            response = await self.__common_get_chat_response(chat_id, query, stream=True)
+            if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
+                response, plugins_used = await self.__handle_function_call(chat_id, response, stream=True)
+                if is_direct_result(response):
+                    yield response, '0'
+                    return
 
-        answer = ''
-        async for chunk in response:
-            if len(chunk.choices) == 0:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                answer += delta.content
-                yield answer, 'not_finished'
-        answer = answer.strip()
-        self.__add_to_history(chat_id, role="assistant", content=answer)
-        tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            answer = ''
+            async for chunk in response:
+                if len(chunk.choices) == 0:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    answer += delta.content
+                    yield answer, 'not_finished'
+            answer = answer.strip()
+            self.__add_to_history(chat_id, role="assistant", content=answer)
+            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
 
-        show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
-        plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
-        if self.config['show_usage']:
-            answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
-            if show_plugins_used:
-                answer += f"\n🔌 {', '.join(plugin_names)}"
-        elif show_plugins_used:
-            answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
+            show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
+            plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
+            if self.config['show_usage']:
+                answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+                if show_plugins_used:
+                    answer += f"\n🔌 {', '.join(plugin_names)}"
+            elif show_plugins_used:
+                answer += f"\n\n---\n🔌 {', '.join(plugin_names)}"
 
-        yield answer, tokens_used
+            yield answer, tokens_used
+        else:
+            # Responses API streaming
+            # Ensure conversation exists and is fresh
+            if chat_id not in self.conversations or self.__max_age_reached(chat_id):
+                self.reset_chat_history(chat_id)
+            self.last_updated[chat_id] = datetime.datetime.now()
+            self.__add_to_history(chat_id, role="user", content=query)
+
+            # Optionally summarise if too long
+            try:
+                token_count = self.__count_tokens(self.conversations[chat_id])
+                exceeded_max_tokens = token_count + self.config['max_tokens'] > self.__max_model_tokens()
+                exceeded_max_history_size = len(self.conversations[chat_id]) > self.config['max_history_size']
+                if exceeded_max_tokens or exceeded_max_history_size:
+                    logging.info(f'Chat history for chat ID {chat_id} is too long. Summarising...')
+                    try:
+                        summary = await self.__summarise(self.conversations[chat_id][:-1])
+                        self.reset_chat_history(chat_id, self.conversations[chat_id][0]['content'])
+                        self.__add_to_history(chat_id, role="assistant", content=summary)
+                        self.__add_to_history(chat_id, role="user", content=query)
+                    except Exception as e:
+                        logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
+                        self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
+            except Exception:
+                pass
+
+            model_to_use = self.config['model']
+            # Build input from history with proper block types
+            input_messages = []
+            for m in self.conversations[chat_id]:
+                converted = self.__to_responses_message(m['role'], m['content'])
+                if converted:
+                    input_messages.append(converted)
+            tools = []
+            use_web_search = self.config.get('enable_web_search', False) and not self.conversations_vision.get(chat_id, False)
+            if use_web_search:
+                tools.append({'type': 'web_search'})
+
+            answer = ''
+            try:
+                # Prepend a formatting guard when using web search to avoid Markdown
+                if use_web_search:
+                    formatting_text = (
+                        'When using web search or tools, format strictly for Telegram: NO Markdown or HTML. '
+                        'Return plain text only. Do not use *, _, `, [], (), or any markup. '
+                        'If you must show a URL, print the raw URL.'
+                    )
+                    input_messages = [{'role': 'system', 'content': [{'type': 'input_text', 'text': formatting_text}]}] + input_messages
+
+                async with self.client.responses.stream(
+                    model=model_to_use,
+                    input=input_messages,
+                    temperature=self.config['temperature'],
+                    max_output_tokens=self.config['max_tokens'],
+                    tools=tools
+                ) as stream:
+                    async for event in stream:
+                        et = getattr(event, 'type', None)
+                        if et == 'response.output_text.delta':
+                            delta = getattr(event, 'delta', '')
+                            if delta:
+                                answer += delta
+                                yield answer, 'not_finished'
+                        elif et == 'response.refusal.delta':
+                            # ignore/refusal accumulation
+                            pass
+                    final = await stream.get_final_response()
+                    answer = answer.strip()
+                    self.__add_to_history(chat_id, role="assistant", content=answer)
+                    tokens_used = getattr(getattr(final, 'usage', None), 'total_tokens', None)
+                    if tokens_used is None:
+                        tokens_used = self.__count_tokens(self.conversations[chat_id])
+                    if self.config['show_usage']:
+                        answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+                    yield answer, str(tokens_used)
+            except Exception as e:
+                logging.warning(f'Responses stream failed, falling back to non-stream: {str(e)}')
+                full, tokens = await self.get_chat_response(chat_id, query)
+                yield full, tokens
 
     @retry(
         reraise=True,
@@ -244,24 +361,118 @@ class OpenAIHelper:
                     logging.warning(f'Error while summarising chat history: {str(e)}. Popping elements instead...')
                     self.conversations[chat_id] = self.conversations[chat_id][-self.config['max_history_size']:]
 
-            max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS else 'max_tokens'
-            common_args = {
-                'model': self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model'],
-                'messages': self.conversations[chat_id],
-                'temperature': self.config['temperature'],
-                'n': self.config['n_choices'],
-                max_tokens_str: self.config['max_tokens'],
-                'presence_penalty': self.config['presence_penalty'],
-                'frequency_penalty': self.config['frequency_penalty'],
-                'stream': stream
-            }
+            if not self.config.get('use_responses_api', False):
+                max_tokens_str = 'max_completion_tokens' if self.config['model'] in O_MODELS else 'max_tokens'
+                common_args = {
+                    'model': self.config['model'] if not self.conversations_vision[chat_id] else self.config['vision_model'],
+                    'messages': self.conversations[chat_id],
+                    'temperature': self.config['temperature'],
+                    'n': self.config['n_choices'],
+                    max_tokens_str: self.config['max_tokens'],
+                    'presence_penalty': self.config['presence_penalty'],
+                    'frequency_penalty': self.config['frequency_penalty'],
+                    'stream': stream
+                }
 
-            if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
-                functions = self.plugin_manager.get_functions_specs()
-                if len(functions) > 0:
-                    common_args['functions'] = self.plugin_manager.get_functions_specs()
-                    common_args['function_call'] = 'auto'
-            return await self.client.chat.completions.create(**common_args)
+                if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
+                    functions = self.plugin_manager.get_functions_specs()
+                    if len(functions) > 0:
+                        common_args['functions'] = self.plugin_manager.get_functions_specs()
+                        common_args['function_call'] = 'auto'
+                return await self.client.chat.completions.create(**common_args)
+            else:
+                # Responses API with optional tools (web_search and plugins)
+                use_web_search = self.config.get('enable_web_search', False) and not self.conversations_vision.get(chat_id, False)
+                tools = [{'type': 'web_search'}] if use_web_search else []
+
+                # Include plugin tools as Responses tools if enabled
+                responses_tools_plugins = []
+                if self.config.get('enable_functions', False):
+                    try:
+                        # Convert function specs into Responses tool schema
+                        for spec in self.plugin_manager.get_functions_specs():
+                            # Minimal mapping: treat as a function tool
+                            name = spec.get('name')
+                            description = spec.get('description', '')
+                            parameters = spec.get('parameters', {'type': 'object', 'properties': {}})
+                            responses_tools_plugins.append({
+                                'type': 'function',
+                                'function': {
+                                    'name': name,
+                                    'description': description,
+                                    'parameters': parameters
+                                }
+                            })
+                    except Exception:
+                        pass
+                if responses_tools_plugins:
+                    tools.extend(responses_tools_plugins)
+
+                model_to_use = self.config['model'] if not self.conversations_vision.get(chat_id, False) else self.config['vision_model']
+                # Convert chat history to Responses input messages
+                input_messages = []
+                for m in self.conversations[chat_id]:
+                    if m['role'] == 'assistant':
+                        continue
+                    converted = self.__to_responses_message(m['role'], m['content'])
+                    if converted:
+                        input_messages.append(converted)
+                # Prepend a formatting guard when using web search to avoid Markdown
+                if use_web_search:
+                    formatting_text = (
+                        'Use only plain text answers, NO Markdown or HTML. '
+                        'Return plain text only. Do not use *, _, `, [], (), or any markup. '
+                        'If you must show a URL, print the raw URL.'
+                    )
+                    input_messages = [{'role': 'system', 'content': [{'type': 'input_text', 'text': formatting_text}]}] + input_messages
+                # Tool execution loop for Responses (non-stream)
+                plugins_used = []
+                resp = await self.client.responses.create(
+                    model=model_to_use,
+                    input=input_messages,
+                    temperature=self.config['temperature'],
+                    max_output_tokens=self.config['max_tokens'],
+                    tools=tools
+                )
+                # Handle tool calls if any
+                max_calls = self.config.get('functions_max_consecutive_calls', 10)
+                calls = 0
+                while getattr(resp, 'status', None) == 'requires_action' and calls < max_calls:
+                    tool_outputs = []
+                    try:
+                        for tool in resp.required_action.submit_tool_outputs.tool_calls:
+                            if tool.type == 'function' and tool.function:
+                                fn_name = tool.function.name
+                                fn_args = tool.function.arguments or '{}'
+                                result = await self.plugin_manager.call_function(fn_name, self, fn_args)
+                                tool_outputs.append({'tool_call_id': tool.id, 'output': result})
+                                plugins_used.append(fn_name)
+                    except Exception as e:
+                        logging.warning(f'Responses tool execution error: {str(e)}')
+                        break
+
+                    resp = await self.client.responses.submit_tool_outputs(
+                        response_id=resp.id,
+                        tool_outputs=tool_outputs
+                    )
+                    calls += 1
+
+                # Finalize answer
+                answer = getattr(resp, 'output_text', '') or ''
+                answer = answer.strip()
+                if answer:
+                    self.__add_to_history(chat_id, role="assistant", content=answer)
+                usage_total = getattr(getattr(resp, 'usage', None), 'total_tokens', None)
+                if usage_total is None:
+                    usage_total = self.__count_tokens(self.conversations[chat_id])
+                if self.config['show_usage']:
+                    bot_language = self.config['bot_language']
+                    answer += "\n\n---\n" \
+                              f"💰 {str(usage_total)} {localized_text('stats_tokens', bot_language)}"
+                    if plugins_used and self.config.get('show_plugins_used', False):
+                        plugin_names = tuple(self.plugin_manager.get_plugin_source_name(p) for p in plugins_used)
+                        answer += f"\n🔌 {', '.join(plugin_names)}"
+                return answer, str(usage_total)
 
         except openai.RateLimitError as e:
             raise e
@@ -439,27 +650,42 @@ class OpenAIHelper:
 
             message = {'role':'user', 'content':content}
 
-            common_args = {
-                'model': self.config['vision_model'],
-                'messages': self.conversations[chat_id][:-1] + [message],
-                'temperature': self.config['temperature'],
-                'n': 1, # several choices is not implemented yet
-                'max_tokens': self.config['vision_max_tokens'],
-                'presence_penalty': self.config['presence_penalty'],
-                'frequency_penalty': self.config['frequency_penalty'],
-                'stream': stream
-            }
-
-
-            # vision model does not yet support functions
-
-            # if self.config['enable_functions']:
-            #     functions = self.plugin_manager.get_functions_specs()
-            #     if len(functions) > 0:
-            #         common_args['functions'] = self.plugin_manager.get_functions_specs()
-            #         common_args['function_call'] = 'auto'
-            
-            return await self.client.chat.completions.create(**common_args)
+            if not self.config.get('use_responses_api', False):
+                common_args = {
+                    'model': self.config['vision_model'],
+                    'messages': self.conversations[chat_id][:-1] + [message],
+                    'temperature': self.config['temperature'],
+                    'n': 1,
+                    'max_tokens': self.config['vision_max_tokens'],
+                    'presence_penalty': self.config['presence_penalty'],
+                    'frequency_penalty': self.config['frequency_penalty'],
+                    'stream': stream
+                }
+                return await self.client.chat.completions.create(**common_args)
+            else:
+                # Responses API vision
+                input_messages = []
+                for m in self.conversations[chat_id][:-1] + [message]:
+                    c = m['content']
+                    if isinstance(c, str):
+                        input_messages.append({'role': m['role'], 'content': [{'type': 'input_text', 'text': c}]})
+                    else:
+                        # convert old style to Responses content types if necessary
+                        converted = []
+                        for part in c:
+                            if part.get('type') == 'text':
+                                converted.append({'type': 'input_text', 'text': part.get('text', '')})
+                            elif part.get('type') == 'image_url':
+                                converted.append({'type': 'input_image', 'image_url': part.get('image_url', {})})
+                            else:
+                                converted.append(part)
+                        input_messages.append({'role': m['role'], 'content': converted})
+                return await self.client.responses.create(
+                    model=self.config['vision_model'],
+                    input=input_messages,
+                    temperature=self.config['temperature'],
+                    max_output_tokens=self.config['vision_max_tokens']
+                )
 
         except openai.RateLimitError as e:
             raise e
@@ -494,27 +720,37 @@ class OpenAIHelper:
 
         answer = ''
 
-        if len(response.choices) > 1 and self.config['n_choices'] > 1:
-            for index, choice in enumerate(response.choices):
-                content = choice.message.content.strip()
-                if index == 0:
-                    self.__add_to_history(chat_id, role="assistant", content=content)
-                answer += f'{index + 1}\u20e3\n'
-                answer += content
-                answer += '\n\n'
+        if not self.config.get('use_responses_api', False):
+            if len(response.choices) > 1 and self.config['n_choices'] > 1:
+                for index, choice in enumerate(response.choices):
+                    content = choice.message.content.strip()
+                    if index == 0:
+                        self.__add_to_history(chat_id, role="assistant", content=content)
+                    answer += f'{index + 1}\u20e3\n'
+                    answer += content
+                    answer += '\n\n'
+            else:
+                answer = response.choices[0].message.content.strip()
+                self.__add_to_history(chat_id, role="assistant", content=answer)
         else:
-            answer = response.choices[0].message.content.strip()
-            self.__add_to_history(chat_id, role="assistant", content=answer)
+            answer = response.output_text.strip() if hasattr(response, 'output_text') and response.output_text else ''
+            if answer:
+                self.__add_to_history(chat_id, role="assistant", content=answer)
 
         bot_language = self.config['bot_language']
         # Plugins are not enabled either
         # show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
         # plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
         if self.config['show_usage']:
-            answer += "\n\n---\n" \
-                      f"💰 {str(response.usage.total_tokens)} {localized_text('stats_tokens', bot_language)}" \
-                      f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
-                      f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+            if not self.config.get('use_responses_api', False):
+                answer += "\n\n---\n" \
+                          f"💰 {str(response.usage.total_tokens)} {localized_text('stats_tokens', bot_language)}" \
+                          f" ({str(response.usage.prompt_tokens)} {localized_text('prompt', bot_language)}," \
+                          f" {str(response.usage.completion_tokens)} {localized_text('completion', bot_language)})"
+            else:
+                usage_total = getattr(response, 'usage', None).total_tokens if getattr(response, 'usage', None) else self.__count_tokens(self.conversations[chat_id])
+                answer += "\n\n---\n" \
+                          f"💰 {str(usage_total)} {localized_text('stats_tokens', bot_language)}"
             # if show_plugins_used:
             #     answer += f"\n🔌 {', '.join(plugin_names)}"
         # elif show_plugins_used:
@@ -542,17 +778,63 @@ class OpenAIHelper:
         #         yield response, '0'
         #         return
 
-        answer = ''
-        async for chunk in response:
-            if len(chunk.choices) == 0:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                answer += delta.content
-                yield answer, 'not_finished'
-        answer = answer.strip()
-        self.__add_to_history(chat_id, role="assistant", content=answer)
-        tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+        if not self.config.get('use_responses_api', False):
+            answer = ''
+            async for chunk in response:
+                if len(chunk.choices) == 0:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    answer += delta.content
+                    yield answer, 'not_finished'
+            answer = answer.strip()
+            self.__add_to_history(chat_id, role="assistant", content=answer)
+            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            if self.config['show_usage']:
+                answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+            yield answer, tokens_used
+        else:
+            # Streaming via Responses for vision
+            model_to_use = self.config['vision_model']
+            # Build input from last prepared content
+            input_messages = []
+            for m in self.conversations[chat_id]:
+                c = m['content']
+                if isinstance(c, str):
+                    input_messages.append({'role': m['role'], 'content': [{'type': 'input_text', 'text': c}]})
+                else:
+                    input_messages.append({'role': m['role'], 'content': c})
+            # Replace last user message with structured content
+            input_messages = input_messages[:-1] + [{'role': 'user', 'content': [
+                {'type': 'input_text', 'text': prompt},
+                {'type': 'input_image', 'image_url': {'url': image, 'detail': self.config['vision_detail']}}
+            ]}]
+
+            answer = ''
+            try:
+                async with self.client.responses.stream(
+                    model=model_to_use,
+                    input=input_messages,
+                    temperature=self.config['temperature'],
+                    max_output_tokens=self.config['vision_max_tokens']
+                ) as stream:
+                    async for event in stream:
+                        if getattr(event, 'type', None) == 'response.output_text.delta':
+                            delta = getattr(event, 'delta', '')
+                            if delta:
+                                answer += delta
+                                yield answer, 'not_finished'
+                    final = await stream.get_final_response()
+                    answer = answer.strip()
+                    self.__add_to_history(chat_id, role="assistant", content=answer)
+                    tokens_used = getattr(final, 'usage', None).total_tokens if getattr(final, 'usage', None) else self.__count_tokens(self.conversations[chat_id])
+                    if self.config['show_usage']:
+                        answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
+                    yield answer, str(tokens_used)
+            except Exception as e:
+                logging.warning(f'Responses vision stream failed, falling back: {str(e)}')
+                interpretation, total_tokens = await self.interpret_image(chat_id, fileobj, prompt)
+                yield interpretation, total_tokens
 
         #show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
         #plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
@@ -612,12 +894,22 @@ class OpenAIHelper:
             {"role": "assistant", "content": "Summarize this conversation in 700 characters or less"},
             {"role": "user", "content": str(conversation)}
         ]
-        response = await self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=messages,
-            temperature=1 if self.config['model'] in O_MODELS else 0.4
-        )
-        return response.choices[0].message.content
+        if not self.config.get('use_responses_api', False):
+            response = await self.client.chat.completions.create(
+                model=self.config['model'],
+                messages=messages,
+                temperature=1 if self.config['model'] in O_MODELS else 0.4
+            )
+            return response.choices[0].message.content
+        else:
+            resp = await self.client.responses.create(
+                model=self.config['model'],
+                input=[{'role':'assistant','content':[{'type':'input_text','text':'Summarize this conversation in 700 characters or less'}]},
+                       {'role':'user','content':[{'type':'input_text','text': str(conversation)}]}],
+                temperature=1 if self.config['model'] in O_MODELS else 0.4,
+                max_output_tokens=500
+            )
+            return resp.output_text
 
     def __max_model_tokens(self):
         base = 4096

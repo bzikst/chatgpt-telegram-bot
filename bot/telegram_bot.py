@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import io
+import time
+from datetime import datetime, timezone
 
 from uuid import uuid4
 from telegram import BotCommandScopeAllGroupChats, Update, constants
@@ -227,10 +229,12 @@ class ChatGPTTelegramBot:
         chat_id = update.effective_chat.id
         reset_content = message_text(update.message)
         self.openai.reset_chat_history(chat_id=chat_id, content=reset_content)
+        t_start = time.monotonic()
         await update.effective_message.reply_text(
             message_thread_id=get_thread_id(update),
             text=localized_text('reset_done', self.config['bot_language'])
         )
+        logging.info(f"Reset reply sent in {time.monotonic() - t_start:.2f}s")
 
     async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -517,7 +521,18 @@ class ChatGPTTelegramBot:
             if user_id not in self.usage:
                 self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
 
+            prev_token_count = 0
             if self.config['stream']:
+                # Snapshot tokens before streaming to compute fallback delta if needed
+                try:
+                    _, prev_token_count = self.openai.get_conversation_stats(chat_id)
+                except Exception:
+                    prev_token_count = 0
+                # Snapshot tokens before streaming to compute fallback delta if needed
+                try:
+                    _, prev_token_count = self.openai.get_conversation_stats(chat_id)
+                except Exception:
+                    prev_token_count = 0
 
                 stream_response = self.openai.interpret_image_stream(chat_id=chat_id, fileobj=temp_file_png, prompt=prompt)
                 i = 0
@@ -594,7 +609,10 @@ class ChatGPTTelegramBot:
 
                     i += 1
                     if tokens != 'not_finished':
-                        total_tokens = int(tokens)
+                        try:
+                            total_tokens = int(tokens)
+                        except Exception:
+                            total_tokens = 0
 
                 
             else:
@@ -652,8 +670,17 @@ class ChatGPTTelegramBot:
         if not await self.check_allowed_and_within_budget(update, context):
             return
 
+        delivery_delay_s = None
+        if update.message and update.message.date:
+            try:
+                delivery_delay_s = (datetime.now(timezone.utc) - update.message.date).total_seconds()
+            except Exception:
+                delivery_delay_s = None
+
         logging.info(
-            f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+            f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})'
+            + (f" | update_delivery_delay_s={delivery_delay_s:.2f}" if delivery_delay_s is not None else "")
+        )
         self.user_messages_logger.info(update.message.text)
         chat_id = update.effective_chat.id
         user_id = update.message.from_user.id
@@ -687,6 +714,12 @@ class ChatGPTTelegramBot:
                     message_thread_id=get_thread_id(update)
                 )
 
+                logging.info("Starting OpenAI streaming response...")
+                # Snapshot tokens before streaming to compute fallback delta if needed
+                try:
+                    _, prev_token_count = self.openai.get_conversation_stats(chat_id)
+                except Exception:
+                    prev_token_count = 0
                 stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
                 i = 0
                 prev = ''
@@ -767,7 +800,9 @@ class ChatGPTTelegramBot:
             else:
                 async def _reply():
                     nonlocal total_tokens
+                    t_ai = time.monotonic()
                     response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+                    logging.info(f"OpenAI non-stream response time: {time.monotonic() - t_ai:.2f}s")
 
                     if is_direct_result(response):
                         return await handle_direct_result(self.config, update, response)
@@ -796,6 +831,15 @@ class ChatGPTTelegramBot:
                                 raise exception
 
                 await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
+
+            # Fallback: if streaming didn't provide tokens, compute delta from conversation
+            if self.config['stream'] and total_tokens == 0:
+                try:
+                    _, new_token_count = self.openai.get_conversation_stats(chat_id)
+                    delta_tokens = max(new_token_count - prev_token_count, 1)
+                    total_tokens = delta_tokens
+                except Exception:
+                    total_tokens = 0
 
             add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
 
@@ -1049,8 +1093,12 @@ class ChatGPTTelegramBot:
         """
         application = ApplicationBuilder() \
             .token(self.config['token']) \
-            .proxy_url(self.config['proxy']) \
-            .get_updates_proxy_url(self.config['proxy']) \
+            .connect_timeout(15.0) \
+            .read_timeout(30.0) \
+            .write_timeout(30.0) \
+            .get_updates_connect_timeout(15.0) \
+            .get_updates_read_timeout(60.0) \
+            .get_updates_write_timeout(30.0) \
             .post_init(self.post_init) \
             .concurrent_updates(True) \
             .build()
