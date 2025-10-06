@@ -389,12 +389,17 @@ class OpenAIHelper:
                 responses_tools_plugins = []
                 if self.config.get('enable_functions', False):
                     try:
-                        # Convert function specs into Responses tool schema
-                        for spec in self.plugin_manager.get_functions_specs():
-                            # Minimal mapping: treat as a function tool
+                        # Convert function specs into Responses tool schema (only valid specs)
+                        for spec in self.plugin_manager.get_functions_specs() or []:
+                            if not isinstance(spec, dict):
+                                continue
                             name = spec.get('name')
-                            description = spec.get('description', '')
-                            parameters = spec.get('parameters', {'type': 'object', 'properties': {}})
+                            if not name or not isinstance(name, str):
+                                continue
+                            description = spec.get('description', '') or ''
+                            parameters = spec.get('parameters')
+                            if not isinstance(parameters, dict):
+                                parameters = {'type': 'object', 'properties': {}}
                             responses_tools_plugins.append({
                                 'type': 'function',
                                 'function': {
@@ -437,7 +442,7 @@ class OpenAIHelper:
                 # Handle tool calls if any
                 max_calls = self.config.get('functions_max_consecutive_calls', 10)
                 calls = 0
-                while getattr(resp, 'status', None) == 'requires_action' and calls < max_calls:
+                while getattr(resp, 'status', None) == 'requires_action' and getattr(getattr(resp, 'required_action', None), 'submit_tool_outputs', None) and calls < max_calls:
                     tool_outputs = []
                     try:
                         for tool in resp.required_action.submit_tool_outputs.tool_calls:
