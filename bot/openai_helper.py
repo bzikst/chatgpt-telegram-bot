@@ -114,6 +114,27 @@ class OpenAIHelper:
         self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
         self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
 
+    def __build_responses_tools(self, chat_id: int) -> list[dict]:
+        """
+        Build a valid Responses API tools list. Only valid shapes:
+        - {'type': 'web_search'}
+        - {'type': 'function', 'function': {'name', 'description', 'parameters'}}
+        
+        NOTE: Functions/plugins are NOT supported with Responses API due to compatibility issues.
+        Only web_search is enabled.
+        """
+        tools: list[dict] = []
+        try:
+            if self.config.get('enable_web_search', False) and not self.conversations_vision.get(chat_id, False):
+                tools.append({'type': 'web_search'})
+            # Functions are disabled for Responses API to avoid compatibility issues
+            # if self.config.get('enable_functions', False):
+            #     specs = self.plugin_manager.get_functions_specs() or []
+            #     ... (plugin processing code disabled)
+        except Exception as e:
+            logging.warning(f'Error building responses tools: {str(e)}')
+        return tools
+
     def __to_responses_message(self, role: str, content) -> dict | None:
         """
         Convert an existing chat message (role, content) into Responses API input message.
@@ -202,7 +223,7 @@ class OpenAIHelper:
                 bot_language = self.config['bot_language']
                 answer += "\n\n---\n" \
                           f"💰 {str(usage_total)} {localized_text('stats_tokens', bot_language)}"
-            return answer, str(usage_total)
+            return answer, usage_total
 
     async def get_chat_response_stream(self, chat_id: int, query: str):
         """
@@ -230,7 +251,7 @@ class OpenAIHelper:
                     yield answer, 'not_finished'
             answer = answer.strip()
             self.__add_to_history(chat_id, role="assistant", content=answer)
-            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            tokens_used = self.__count_tokens(self.conversations[chat_id])
 
             show_plugins_used = len(plugins_used) > 0 and self.config['show_plugins_used']
             plugin_names = tuple(self.plugin_manager.get_plugin_source_name(plugin) for plugin in plugins_used)
@@ -275,10 +296,8 @@ class OpenAIHelper:
                 converted = self.__to_responses_message(m['role'], m['content'])
                 if converted:
                     input_messages.append(converted)
-            tools = []
-            use_web_search = self.config.get('enable_web_search', False) and not self.conversations_vision.get(chat_id, False)
-            if use_web_search:
-                tools.append({'type': 'web_search'})
+            tools = self.__build_responses_tools(chat_id)
+            use_web_search = any(t.get('type') == 'web_search' for t in tools)
 
             answer = ''
             try:
@@ -316,7 +335,7 @@ class OpenAIHelper:
                         tokens_used = self.__count_tokens(self.conversations[chat_id])
                     if self.config['show_usage']:
                         answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
-                    yield answer, str(tokens_used)
+                    yield answer, tokens_used
             except Exception as e:
                 logging.warning(f'Responses stream failed, falling back to non-stream: {str(e)}')
                 full, tokens = await self.get_chat_response(chat_id, query)
@@ -382,36 +401,8 @@ class OpenAIHelper:
                 return await self.client.chat.completions.create(**common_args)
             else:
                 # Responses API with optional tools (web_search and plugins)
-                use_web_search = self.config.get('enable_web_search', False) and not self.conversations_vision.get(chat_id, False)
-                tools = [{'type': 'web_search'}] if use_web_search else []
-
-                # Include plugin tools as Responses tools if enabled
-                responses_tools_plugins = []
-                if self.config.get('enable_functions', False):
-                    try:
-                        # Convert function specs into Responses tool schema (only valid specs)
-                        for spec in self.plugin_manager.get_functions_specs() or []:
-                            if not isinstance(spec, dict):
-                                continue
-                            name = spec.get('name')
-                            if not name or not isinstance(name, str):
-                                continue
-                            description = spec.get('description', '') or ''
-                            parameters = spec.get('parameters')
-                            if not isinstance(parameters, dict):
-                                parameters = {'type': 'object', 'properties': {}}
-                            responses_tools_plugins.append({
-                                'type': 'function',
-                                'function': {
-                                    'name': name,
-                                    'description': description,
-                                    'parameters': parameters
-                                }
-                            })
-                    except Exception:
-                        pass
-                if responses_tools_plugins:
-                    tools.extend(responses_tools_plugins)
+                tools = self.__build_responses_tools(chat_id)
+                use_web_search = any(t.get('type') == 'web_search' for t in tools)
 
                 model_to_use = self.config['model'] if not self.conversations_vision.get(chat_id, False) else self.config['vision_model']
                 # Convert chat history to Responses input messages
@@ -462,22 +453,9 @@ class OpenAIHelper:
                     )
                     calls += 1
 
-                # Finalize answer
-                answer = getattr(resp, 'output_text', '') or ''
-                answer = answer.strip()
-                if answer:
-                    self.__add_to_history(chat_id, role="assistant", content=answer)
-                usage_total = getattr(getattr(resp, 'usage', None), 'total_tokens', None)
-                if usage_total is None:
-                    usage_total = self.__count_tokens(self.conversations[chat_id])
-                if self.config['show_usage']:
-                    bot_language = self.config['bot_language']
-                    answer += "\n\n---\n" \
-                              f"💰 {str(usage_total)} {localized_text('stats_tokens', bot_language)}"
-                    if plugins_used and self.config.get('show_plugins_used', False):
-                        plugin_names = tuple(self.plugin_manager.get_plugin_source_name(p) for p in plugins_used)
-                        answer += f"\n🔌 {', '.join(plugin_names)}"
-                return answer, str(usage_total)
+                # Return the response object for Responses API
+                # Processing will be done in get_chat_response
+                return resp
 
         except openai.RateLimitError as e:
             raise e
@@ -794,7 +772,7 @@ class OpenAIHelper:
                     yield answer, 'not_finished'
             answer = answer.strip()
             self.__add_to_history(chat_id, role="assistant", content=answer)
-            tokens_used = str(self.__count_tokens(self.conversations[chat_id]))
+            tokens_used = self.__count_tokens(self.conversations[chat_id])
             if self.config['show_usage']:
                 answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
             yield answer, tokens_used
@@ -835,7 +813,7 @@ class OpenAIHelper:
                     tokens_used = getattr(final, 'usage', None).total_tokens if getattr(final, 'usage', None) else self.__count_tokens(self.conversations[chat_id])
                     if self.config['show_usage']:
                         answer += f"\n\n---\n💰 {tokens_used} {localized_text('stats_tokens', self.config['bot_language'])}"
-                    yield answer, str(tokens_used)
+                    yield answer, tokens_used
             except Exception as e:
                 logging.warning(f'Responses vision stream failed, falling back: {str(e)}')
                 interpretation, total_tokens = await self.interpret_image(chat_id, fileobj, prompt)
