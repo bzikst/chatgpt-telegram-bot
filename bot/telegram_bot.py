@@ -39,10 +39,10 @@ class ChatGPTTelegramBot:
         self.openai = openai
         bot_language = self.config['bot_language']
         self.commands = [
-            BotCommand(command='help', description=localized_text('help_description', bot_language)),
+            #BotCommand(command='help', description=localized_text('help_description', bot_language)),
             BotCommand(command='reset', description=localized_text('reset_description', bot_language)),
-            BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
-            BotCommand(command='resend', description=localized_text('resend_description', bot_language))
+            #BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
+            #BotCommand(command='resend', description=localized_text('resend_description', bot_language))
         ]
         # If imaging is enabled, add the "image" command to the list
         if self.config.get('enable_image_generation', False):
@@ -60,6 +60,13 @@ class ChatGPTTelegramBot:
         self.last_message = {}
         self.inline_queries_cache = {}
 
+        self.user_messages_logger = logging.getLogger("user_messages")
+        self.user_messages_logger.setLevel(logging.INFO)
+        fh = logging.FileHandler("user_messages.log", encoding="utf-8")
+        formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        fh.setFormatter(formatter)
+        self.user_messages_logger.addHandler(fh)
+
     async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Shows the help menu.
@@ -67,15 +74,7 @@ class ChatGPTTelegramBot:
         commands = self.group_commands if is_group_chat(update) else self.commands
         commands_description = [f'/{command.command} - {command.description}' for command in commands]
         bot_language = self.config['bot_language']
-        help_text = (
-                localized_text('help_text', bot_language)[0] +
-                '\n\n' +
-                '\n'.join(commands_description) +
-                '\n\n' +
-                localized_text('help_text', bot_language)[1] +
-                '\n\n' +
-                localized_text('help_text', bot_language)[2]
-        )
+        help_text = '\n\n'.join(localized_text('help_text', bot_language))
         await update.message.reply_text(help_text, disable_web_page_preview=True)
 
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,6 +654,7 @@ class ChatGPTTelegramBot:
 
         logging.info(
             f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
+        self.user_messages_logger.info(update.message.text)
         chat_id = update.effective_chat.id
         user_id = update.message.from_user.id
         prompt = message_text(update.message)
@@ -843,8 +843,7 @@ class ChatGPTTelegramBot:
                 title=localized_text("ask_chatgpt", bot_language),
                 input_message_content=InputTextMessageContent(message_content),
                 description=message_content,
-                thumb_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea'
-                          '-b02a7a32149a.png',
+                thumbnail_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png',
                 reply_markup=reply_markup
             )
 
