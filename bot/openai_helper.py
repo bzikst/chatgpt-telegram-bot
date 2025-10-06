@@ -408,8 +408,6 @@ class OpenAIHelper:
                 # Convert chat history to Responses input messages
                 input_messages = []
                 for m in self.conversations[chat_id]:
-                    if m['role'] == 'assistant':
-                        continue
                     converted = self.__to_responses_message(m['role'], m['content'])
                     if converted:
                         input_messages.append(converted)
