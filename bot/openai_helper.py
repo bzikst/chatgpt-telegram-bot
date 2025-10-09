@@ -153,8 +153,15 @@ class OpenAIHelper:
                     block_type = 'input_text' if role in ('user', 'system', 'developer') else 'output_text'
                     blocks.append({'type': block_type, 'text': part.get('text', '')})
                 elif ptype == 'image_url':
-                    # convert to input_image; assistant images are rare, treat as input_image for simplicity
-                    blocks.append({'type': 'input_image', 'image_url': part.get('image_url', {})})
+                    # convert to input_image; extract URL string from object if needed
+                    image_url_data = part.get('image_url', {})
+                    if isinstance(image_url_data, dict):
+                        # Extract URL string from {'url': '...', 'detail': '...'} format
+                        image_url = image_url_data.get('url', '')
+                    else:
+                        # Already a string
+                        image_url = image_url_data
+                    blocks.append({'type': 'input_image', 'image_url': image_url})
                 else:
                     # passthrough unknown
                     blocks.append(part)
@@ -657,7 +664,13 @@ class OpenAIHelper:
                             if part.get('type') == 'text':
                                 converted.append({'type': 'input_text', 'text': part.get('text', '')})
                             elif part.get('type') == 'image_url':
-                                converted.append({'type': 'input_image', 'image_url': part.get('image_url', {})})
+                                # Extract URL string from object if needed
+                                image_url_data = part.get('image_url', {})
+                                if isinstance(image_url_data, dict):
+                                    image_url = image_url_data.get('url', '')
+                                else:
+                                    image_url = image_url_data
+                                converted.append({'type': 'input_image', 'image_url': image_url})
                             else:
                                 converted.append(part)
                         input_messages.append({'role': m['role'], 'content': converted})
@@ -786,9 +799,10 @@ class OpenAIHelper:
                 else:
                     input_messages.append({'role': m['role'], 'content': c})
             # Replace last user message with structured content
+            # Note: Responses API expects just the URL string, not an object with 'url' and 'detail'
             input_messages = input_messages[:-1] + [{'role': 'user', 'content': [
                 {'type': 'input_text', 'text': prompt},
-                {'type': 'input_image', 'image_url': {'url': image, 'detail': self.config['vision_detail']}}
+                {'type': 'input_image', 'image_url': image}
             ]}]
 
             answer = ''
